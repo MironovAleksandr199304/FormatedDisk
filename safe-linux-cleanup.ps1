@@ -48,11 +48,31 @@ function Get-SafePartitionKind {
 
 function Show-Disks {
     Write-Step 'Available physical disks'
-    $disks = Get-Disk | Sort-Object Number
-    $disks |
-        Select-Object @{Name='DiskNumber';Expression={$_.Number}}, FriendlyName,
-            @{Name='Size';Expression={Format-Size $_.Size}}, PartitionStyle, IsBoot, IsSystem |
-        Format-Table -AutoSize
+
+    try {
+        $disks = Get-Disk -ErrorAction Stop | Sort-Object Number
+    }
+    catch {
+        throw "Get-Disk failed: $($_.Exception.Message)"
+    }
+
+    if (-not $disks -or $disks.Count -eq 0) {
+        Write-Host 'No disks returned by Get-Disk.' -ForegroundColor Yellow
+        return @()
+    }
+
+    $rows = $disks | ForEach-Object {
+        [pscustomobject]@{
+            DiskNumber     = $_.Number
+            FriendlyName   = $_.FriendlyName
+            Size           = Format-Size $_.Size
+            PartitionStyle = $_.PartitionStyle
+            IsBoot         = $_.IsBoot
+            IsSystem       = $_.IsSystem
+        }
+    }
+
+    $rows | Format-Table -AutoSize | Out-Host
     return $disks
 }
 
@@ -158,6 +178,7 @@ try {
     }
 
     $disks = Show-Disks
+    if (-not $disks -or $disks.Count -eq 0) { throw 'No available disks to process.' }
     $diskInput = Read-Host 'Enter target DiskNumber'
     if ($diskInput -notmatch '^\d+$') { throw 'DiskNumber must be numeric.' }
     $diskNumber = [int]$diskInput
