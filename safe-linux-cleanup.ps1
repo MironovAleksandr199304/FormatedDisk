@@ -13,8 +13,8 @@ function Write-Step {
 }
 
 function Test-Administrator {
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($id)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
@@ -29,84 +29,70 @@ function Format-Size {
 function Get-PartitionFileSystem {
     param($Partition)
     try {
-        $volume = Get-Volume -Partition $Partition -ErrorAction Stop
-        return $volume.FileSystem
+        (Get-Volume -Partition $Partition -ErrorAction Stop).FileSystem
     }
     catch {
-        return 'Unknown/None'
+        'Unknown/None'
     }
 }
 
 function Get-SafePartitionKind {
     param($Partition)
-
     $ptype = [string]$Partition.Type
-    $gptType = [string]$Partition.GptType
-    $mbrType = [string]$Partition.MbrType
+    $gpt = [string]$Partition.GptType
 
-    if ($ptype -match 'System' -or $ptype -match 'Reserved' -or $ptype -match 'Recovery') { return 'Protected' }
-    if ($gptType -match 'EFI|C12A7328' -or $gptType -match 'E3C9E316' -or $gptType -match 'DE94BBA4') { return 'Protected' }
-    if ($mbrType -match 'IFS|FAT32|Extended|Unknown') {
-        # MBR type alone is not always reliable, do not mark everything as protected.
-    }
-
+    if ($ptype -match 'System|Reserved|Recovery') { return 'Protected' }
+    if ($gpt -match 'EFI|C12A7328|E3C9E316|DE94BBA4') { return 'Protected' }
     return 'Regular'
 }
 
 function Show-Disks {
-    Write-Step 'Доступные физические диски'
+    Write-Step 'Available physical disks'
     $disks = Get-Disk | Sort-Object Number
-    $disks | Select-Object \
-        @{Name='DiskNumber';Expression={$_.Number}},
-        FriendlyName,
-        @{Name='Size';Expression={Format-Size $_.Size}},
-        PartitionStyle,
-        IsBoot,
-        IsSystem | Format-Table -AutoSize
+    $disks |
+        Select-Object @{Name='DiskNumber';Expression={$_.Number}}, FriendlyName,
+            @{Name='Size';Expression={Format-Size $_.Size}}, PartitionStyle, IsBoot, IsSystem |
+        Format-Table -AutoSize
     return $disks
 }
 
 function Show-Partitions {
     param([int]$DiskNumber)
-
-    Write-Step "Разделы на диске $DiskNumber"
-    $partitions = Get-Partition -DiskNumber $DiskNumber | Sort-Object PartitionNumber
-    if (-not $partitions) {
-        Write-Host 'Разделов не найдено.' -ForegroundColor Yellow
+    Write-Step "Partitions on disk $DiskNumber"
+    $parts = Get-Partition -DiskNumber $DiskNumber | Sort-Object PartitionNumber
+    if (-not $parts) {
+        Write-Host 'No partitions found.' -ForegroundColor Yellow
         return @()
     }
 
-    $rows = foreach ($p in $partitions) {
+    $parts | ForEach-Object {
         [pscustomobject]@{
-            PartitionNumber = $p.PartitionNumber
-            DriveLetter     = if ($p.DriveLetter) { $p.DriveLetter } else { '-' }
-            Size            = Format-Size $p.Size
-            Type            = [string]$p.Type
-            FileSystem      = Get-PartitionFileSystem -Partition $p
-            Safety          = Get-SafePartitionKind -Partition $p
+            PartitionNumber = $_.PartitionNumber
+            DriveLetter     = if ($_.DriveLetter) { $_.DriveLetter } else { '-' }
+            Size            = Format-Size $_.Size
+            Type            = [string]$_.Type
+            FileSystem      = Get-PartitionFileSystem -Partition $_
+            Safety          = Get-SafePartitionKind -Partition $_
         }
-    }
+    } | Format-Table -AutoSize
 
-    $rows | Format-Table -AutoSize
-    return $partitions
+    return $parts
 }
 
 function Require-ConfirmationPhrase {
     param([int]$DiskNumber)
-
     $required = "DELETE DISK $DiskNumber"
-    Write-Host "Для подтверждения введите точно: $required" -ForegroundColor Yellow
-    $inputPhrase = Read-Host 'Подтверждение'
-    if ($inputPhrase -ne $required) {
-        throw 'Подтверждение не совпало. Операция отменена.'
+    Write-Host "Type exactly: $required" -ForegroundColor Yellow
+    if ((Read-Host 'Confirmation') -ne $required) {
+        throw 'Confirmation phrase mismatch. Operation cancelled.'
     }
 }
 
 function Invoke-WholeDiskMode {
     param([int]$DiskNumber, [string]$FileSystem, [bool]$DoExecute)
+    Write-Step 'WholeDiskMode: wipe selected non-system disk'
 
-    Write-Step 'Режим WholeDiskMode: полная очистка выбранного НЕсистемного диска'
-    $actions = @(
+    $plan = @(
         "Clear-Disk -Number $DiskNumber -RemoveData -Confirm:`$false",
         "Initialize-Disk -Number $DiskNumber -PartitionStyle GPT",
         "New-Partition -DiskNumber $DiskNumber -UseMaximumSize -AssignDriveLetter",
@@ -114,130 +100,97 @@ function Invoke-WholeDiskMode {
     )
 
     if (-not $DoExecute) {
-        Write-Host 'DRY RUN: Будут выполнены команды:' -ForegroundColor Yellow
-        $actions | ForEach-Object { Write-Host "  - $_" }
+        Write-Host 'DRY RUN plan:' -ForegroundColor Yellow
+        $plan | ForEach-Object { Write-Host "  - $_" }
         return $null
     }
 
     Clear-Disk -Number $DiskNumber -RemoveData -Confirm:$false
     Initialize-Disk -Number $DiskNumber -PartitionStyle GPT
-    $newPartition = New-Partition -DiskNumber $DiskNumber -UseMaximumSize -AssignDriveLetter
-    $formatted = Format-Volume -Partition $newPartition -FileSystem $FileSystem -NewFileSystemLabel 'Data' -Confirm:$false
+    $part = New-Partition -DiskNumber $DiskNumber -UseMaximumSize -AssignDriveLetter
+    $vol = Format-Volume -Partition $part -FileSystem $FileSystem -NewFileSystemLabel 'Data' -Confirm:$false
 
-    return [pscustomobject]@{
-        Mode       = 'WholeDiskMode'
-        DiskNumber = $DiskNumber
-        FileSystem = $formatted.FileSystem
-        DriveLetter = $formatted.DriveLetter
-    }
+    [pscustomobject]@{ Mode='WholeDiskMode'; DiskNumber=$DiskNumber; FileSystem=$vol.FileSystem; DriveLetter=$vol.DriveLetter }
 }
 
 function Invoke-PartitionMode {
     param([int]$DiskNumber, [string]$FileSystem, [bool]$DoExecute)
+    Write-Step 'PartitionMode: delete selected partitions only'
 
-    Write-Step 'Режим PartitionMode: удаление только выбранных разделов'
     $parts = Show-Partitions -DiskNumber $DiskNumber
-    if (-not $parts -or $parts.Count -eq 0) {
-        throw 'На диске нет разделов для удаления.'
-    }
+    if (-not $parts -or $parts.Count -eq 0) { throw 'No partitions available to remove.' }
 
-    $selected = Read-Host 'Введите номера разделов для удаления через запятую (например 4,5)'
+    $selected = Read-Host 'Enter partition numbers to remove (comma-separated, e.g. 4,5)'
     $targets = $selected -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Select-Object -Unique
-    if (-not $targets -or $targets.Count -eq 0) {
-        throw 'Не выбраны корректные номера разделов.'
-    }
+    if (-not $targets -or $targets.Count -eq 0) { throw 'No valid partition numbers selected.' }
 
-    $removeList = @()
-    foreach ($num in $targets) {
-        $partition = $parts | Where-Object PartitionNumber -eq $num
-        if (-not $partition) {
-            throw "Раздел $num не найден на диске $DiskNumber."
-        }
-
-        $safety = Get-SafePartitionKind -Partition $partition
-        if ($safety -eq 'Protected') {
-            throw "Раздел $num защищён (EFI/System/Recovery/MSR) и не может быть удалён."
-        }
-
-        $removeList += $partition
+    $removeList = foreach ($n in $targets) {
+        $p = $parts | Where-Object PartitionNumber -eq $n
+        if (-not $p) { throw "Partition $n not found on disk $DiskNumber." }
+        if ((Get-SafePartitionKind -Partition $p) -eq 'Protected') { throw "Partition $n is protected (EFI/System/Recovery/MSR)." }
+        $p
     }
 
     if (-not $DoExecute) {
-        Write-Host 'DRY RUN: Будут удалены разделы:' -ForegroundColor Yellow
+        Write-Host 'DRY RUN: partitions to remove:' -ForegroundColor Yellow
         $removeList | ForEach-Object { Write-Host "  - Partition $($_.PartitionNumber) ($(Format-Size $_.Size))" }
-        Write-Host "DRY RUN: Затем будет создан новый раздел и форматирован в $FileSystem" -ForegroundColor Yellow
+        Write-Host "DRY RUN: create and format a new $FileSystem partition." -ForegroundColor Yellow
         return $null
     }
 
-    foreach ($partition in $removeList) {
-        Remove-Partition -DiskNumber $DiskNumber -PartitionNumber $partition.PartitionNumber -Confirm:$false
+    $removeList | ForEach-Object {
+        Remove-Partition -DiskNumber $DiskNumber -PartitionNumber $_.PartitionNumber -Confirm:$false
     }
 
-    $newPartition = New-Partition -DiskNumber $DiskNumber -UseMaximumSize -AssignDriveLetter
-    $formatted = Format-Volume -Partition $newPartition -FileSystem $FileSystem -NewFileSystemLabel 'Data' -Confirm:$false
+    $newPart = New-Partition -DiskNumber $DiskNumber -UseMaximumSize -AssignDriveLetter
+    $newVol = Format-Volume -Partition $newPart -FileSystem $FileSystem -NewFileSystemLabel 'Data' -Confirm:$false
 
-    return [pscustomobject]@{
-        Mode        = 'PartitionMode'
-        DiskNumber  = $DiskNumber
-        PartitionsRemoved = ($removeList.PartitionNumber -join ',')
-        FileSystem  = $formatted.FileSystem
-        DriveLetter = $formatted.DriveLetter
-    }
+    [pscustomobject]@{ Mode='PartitionMode'; DiskNumber=$DiskNumber; PartitionsRemoved=($removeList.PartitionNumber -join ','); FileSystem=$newVol.FileSystem; DriveLetter=$newVol.DriveLetter }
 }
 
 try {
-    if (-not (Test-Administrator)) {
-        throw 'Скрипт должен быть запущен с правами администратора (Run as Administrator).'
-    }
+    if (-not (Test-Administrator)) { throw 'Run this script as Administrator.' }
 
-    Write-Host 'ВНИМАНИЕ: операция необратимо удаляет данные.' -ForegroundColor Red
+    Write-Host 'WARNING: this operation permanently deletes data.' -ForegroundColor Red
     if (-not $Execute) {
-        Write-Host 'Сейчас включён DRY RUN (безопасный режим): изменения не будут применены.' -ForegroundColor Yellow
-        Write-Host 'Для реального выполнения добавьте параметр -Execute.' -ForegroundColor Yellow
+        Write-Host 'DRY RUN mode is active. No destructive changes will be applied.' -ForegroundColor Yellow
+        Write-Host 'Use -Execute to perform actual changes.' -ForegroundColor Yellow
     }
 
     $disks = Show-Disks
-    $diskInput = Read-Host 'Введите DiskNumber целевого диска'
-    if ($diskInput -notmatch '^\d+$') {
-        throw 'DiskNumber должен быть числом.'
-    }
+    $diskInput = Read-Host 'Enter target DiskNumber'
+    if ($diskInput -notmatch '^\d+$') { throw 'DiskNumber must be numeric.' }
     $diskNumber = [int]$diskInput
 
     $targetDisk = $disks | Where-Object Number -eq $diskNumber
-    if (-not $targetDisk) {
-        throw "Диск $diskNumber не найден."
-    }
-
+    if (-not $targetDisk) { throw "Disk $diskNumber not found." }
     if ($targetDisk.IsBoot -or $targetDisk.IsSystem) {
-        throw "Диск $diskNumber является системным/загрузочным (IsBoot=$($targetDisk.IsBoot), IsSystem=$($targetDisk.IsSystem)). Очистка запрещена."
+        throw "Disk $diskNumber is Boot/System (IsBoot=$($targetDisk.IsBoot), IsSystem=$($targetDisk.IsSystem)); operation blocked."
     }
 
     Show-Partitions -DiskNumber $diskNumber | Out-Null
     Require-ConfirmationPhrase -DiskNumber $diskNumber
 
-    Write-Host "Выберите режим: [1] WholeDiskMode (полная очистка диска) [2] PartitionMode (удаление только выбранных разделов)" -ForegroundColor Cyan
-    $modeChoice = Read-Host 'Введите 1 или 2'
+    Write-Host 'Select mode: [1] WholeDiskMode, [2] PartitionMode' -ForegroundColor Cyan
+    $modeChoice = Read-Host 'Enter 1 or 2'
 
-    $result = $null
-    switch ($modeChoice) {
-        '1' { $result = Invoke-WholeDiskMode -DiskNumber $diskNumber -FileSystem $FileSystem -DoExecute:$Execute }
-        '2' { $result = Invoke-PartitionMode -DiskNumber $diskNumber -FileSystem $FileSystem -DoExecute:$Execute }
-        default { throw 'Некорректный выбор режима. Нужно ввести 1 или 2.' }
+    $result = switch ($modeChoice) {
+        '1' { Invoke-WholeDiskMode -DiskNumber $diskNumber -FileSystem $FileSystem -DoExecute:$Execute }
+        '2' { Invoke-PartitionMode -DiskNumber $diskNumber -FileSystem $FileSystem -DoExecute:$Execute }
+        default { throw 'Invalid mode selection. Enter 1 or 2.' }
     }
 
-    Write-Step 'Итог'
+    Write-Step 'Summary'
     if (-not $Execute) {
-        Write-Host "DRY RUN завершён. Диск: $diskNumber. Режим: $modeChoice. Планируемая ФС: $FileSystem." -ForegroundColor Green
+        Write-Host "DRY RUN complete. Disk: $diskNumber. Requested FS: $FileSystem." -ForegroundColor Green
     }
     else {
-        Write-Host "Операция завершена. Диск: $($result.DiskNumber). Режим: $($result.Mode)." -ForegroundColor Green
-        if ($result.PartitionsRemoved) {
-            Write-Host "Удалены разделы: $($result.PartitionsRemoved)." -ForegroundColor Green
-        }
-        Write-Host "Создана файловая система: $($result.FileSystem). Буква диска: $($result.DriveLetter)." -ForegroundColor Green
+        Write-Host "Done. Disk: $($result.DiskNumber). Mode: $($result.Mode)." -ForegroundColor Green
+        if ($result.PartitionsRemoved) { Write-Host "Removed partitions: $($result.PartitionsRemoved)." -ForegroundColor Green }
+        Write-Host "Created FS: $($result.FileSystem). Drive letter: $($result.DriveLetter)." -ForegroundColor Green
     }
 }
 catch {
-    Write-Error "Ошибка: $($_.Exception.Message)"
+    Write-Error "Error: $($_.Exception.Message)"
     exit 1
 }
